@@ -2,6 +2,9 @@
 #coding: utf-8
 
 
+# import pdb; pdb.set_trace()
+
+
 import time
 import datetime
 import os
@@ -9,6 +12,7 @@ import sys
 import logging
 import argparse
 import re
+import signal
 from threading import Thread
 
 
@@ -17,25 +21,31 @@ from netfilter.rule import Rule,Match
 from netfilter.table import Table
 # System and process utilities.
 import psutil
+import tailer
 # Process demonisation.
-from daemons.prefab import run
+from daemon import DaemonContext
+try:
+    from daemon.pidfile import TimeoutPIDLockFile as PIDLockFile
+except:
+    from daemon.pidlockfile import PIDLockFile
 
 
-class PortKnocker(run.RunDaemon):
+# class PortKnocker(run.RunDaemon):
+class PortKnocker():
     '''
     Class for analysis iptables log messages and open port upon attempt connect to port.
     '''
-    def __init__(self, pidfile):
-        super().__init__(pidfile=pidfile)
-
+    def __init__(self, *args, **kwargs):
         # Files for processing.
-        self.iptables_logfile = "/var/log/syslog"
+        self.pidfile = kwargs["pidfile"]
+        self.portknocker_logfile = "/var/log/portknocker_daemon.log"
+        self.iptables_logfile = "/dev/shm/iptables.log"
         self.dumpfile = os.path.dirname(os.path.realpath(__file__)) + os.sep + "portknocker.dmp"
 
-        # Logger parameters for daemon. 
+        # Logger parameters for daemon.
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
-        self.fh = logging.FileHandler('/var/log/portknocker_daemon.log')
+        self.fh = logging.FileHandler(self.portknocker_logfile)
         self.fh.setLevel(logging.INFO)
         self.formatstr = '%(asctime)s - %(levelname)s - %(message)s'
         self.formatter = logging.Formatter(self.formatstr)
@@ -51,25 +61,20 @@ class PortKnocker(run.RunDaemon):
         # Clean for start, stop and restart daemon.
         self.clean()
 
+        # self._demonize()
+
 
     def tail(self, monfile):
         '''
         Get last line in file,  similarly to tail -f filename.
         '''
         try:
-            monfile.seek(0, os.SEEK_END)
+            while True:
+                for line in tailer.follow(monfile, 1):
+                    time.sleep(0.1)
+                    yield line
         except:
             self.logger.error("Error while log-file parsing.")
-
-        while True:
-            try:
-                line = monfile.readline()
-            except:
-                self.logger.error("Error while read log-file.")
-            if not line:
-                time.sleep(0.1)
-                continue
-            yield line
 
 
     def set_rule(self, in_int, port, src_ip):
@@ -281,8 +286,12 @@ class PortKnocker(run.RunDaemon):
         '''
         Master cycle running netfilter log file analyser for search in him new connection records. 
         You need set netfilter rule, equivalent to this template:
-        -A INPUT -i eno1 -p tcp -m multiport --dports $start_port:$end_port -j LOG --log-prefix "Iptables: port_knocker "
+        start_port=10000:10049,10051 && \
+        end_port=50000 && \
+        iptables -I INPUT -i enp0s3 -p tcp -m multiport --dports $start_port:$end_port -j DROP && \
+        iptables -I INPUT -i enp0s3 -p tcp -m multiport --dports $start_port:$end_port -j LOG --log-prefix "Iptables: port_knocker " 
         '''
+        self.setting_up_rsyslog()
         self.logger.info("PortKnocker running ...")
         reserved_port = self.port_connection_reservate()
         with open(self.iptables_logfile, "w+") as f:
@@ -291,21 +300,114 @@ class PortKnocker(run.RunDaemon):
                 # input interface, destination port and note about SYN type package.
                 if ("Iptables: port_knocker" in line) and (line.find(" DPT=") and line.find(" SYN ")):
                     reserved_port(str(*re.findall(r"IN=\w+", line))[3:], str(*re.findall(r"DPT=\d+", line))[4:], str(*re.findall(r"SRC=[\d+\.]+", line))[4:])
+                self.clean_log()
+
+
+    def setting_up_rsyslog(self):
+        '''
+        Configuring rsislog settings for iptables logging.
+        '''
+        rsyslog_confd_file = "/etc/rsyslog.d/10-iptables.conf"
+        rsyslog_cfg_string = f':msg, contains, "Iptables: port_knocker " -{self.iptables_logfile}\n& ~'
+        try:
+            with open(rsyslog_confd_file, "r") as rsys_confd:
+                for line in rsys_confd.readlines():
+                    if "Iptables: port_knocker" in line:
+                        return
+                raise FileNotFoundError
+        except FileNotFoundError:
+            with open(rsyslog_confd_file, "w+") as rsys_confd:
+                rsys_confd.write(rsyslog_cfg_string)
+                self.logger.info(f"Added settings to {rsyslog_confd_file}")
+        try:
+            os.system("systemctl restart rsyslog")
+        except:
+            self.logger.error("Check for the rsyslog service. Portknocker demon stopped.")
+            self.clean()
+            sys.exit()
+
+
+    def clean_log(self, *args, **kwargs):
+        '''
+        '''
+        try:
+            logfile = kwargs["logfile"]
+            critical_size = kwargs["critical_size"]
+        except:
+            logfile = self.iptables_logfile
+            critical_size = 1048576
+        try:
+            if os.path.getsize(logfile) >= critical_size:
+                open(logfile, "w").close()
+        except:
+            self.logger.warning(f"Failed to clean up {logfile} file")
+
+
+    def _demonize(self):
+        '''
+        Demonization of the portknocker process.
+        '''
+        self._terminate_daemon_process()
+        if os.path.exists(self.pidfile):
+            try:
+                os.remove(self.pidfile)
+            except:
+                self.logger.error(f"Pleas check {self.pidfile} permissons and delete him.")
+                sys.exit()
+        self._start()
+
+
+    def _start(self):
+        '''
+        Set the daemon context and run the application.
+        '''
+        pidlock = PIDLockFile(self.pidfile)
+        with DaemonContext(
+                pidfile = pidlock,
+                working_directory = os.path.dirname(os.path.realpath(__file__)) + os.sep,
+                stdout = self.fh.stream,
+                stderr = self.fh.stream):
+            return self.run()
+
+
+    def _terminate_daemon_process(self):
+        '''
+        Exit the daemon process specified in the current PID file.
+        '''
+        self.clean()
+        try:
+            with open(self.pidfile, "r") as pidfile:
+                pid = int(pidfile.readline().strip())
+        except:
+            self.logger.error(f"Failed to read pidfile {self.pidfile}")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+            self.logger.info("Portknocker demon stopped.")
+        except:
+            self.logger.error(f"Failed to terminate {pid}.")
+            return
+
+
+    def _restart(self):
+        '''
+        Restart daemon.
+        '''
+        self._terminate_daemon_process()
+        self._start()
 
 
 if __name__ == "__main__":
-
-    portknocker = PortKnocker('/var/run/portknocker.pid')
-
+    portknocker = PortKnocker(pidfile = '/var/run/portknocker.pid')
 
     def start(arg):
-        portknocker.start()
+        portknocker._demonize()
 
     def stop(arg):
-        portknocker.stop()
+        portknocker._terminate_daemon_process()
 
     def restart(arg):
-        portknocker.restart()
+        portknocker._restart()
 
 
     parser = argparse.ArgumentParser(description = "PortKnocker daemon.")
