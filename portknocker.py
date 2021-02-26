@@ -30,7 +30,6 @@ except:
     from daemon.pidlockfile import PIDLockFile
 
 
-# class PortKnocker(run.RunDaemon):
 class PortKnocker():
     '''
     Class for analysis iptables log messages and open port upon attempt connect to port.
@@ -60,8 +59,6 @@ class PortKnocker():
         
         # Clean for start, stop and restart daemon.
         self.clean()
-
-        # self._demonize()
 
 
     def tail(self, monfile):
@@ -329,6 +326,7 @@ class PortKnocker():
 
     def clean_log(self, *args, **kwargs):
         '''
+        Cleaning log-files.
         '''
         try:
             logfile = kwargs["logfile"]
